@@ -235,27 +235,35 @@ def main():
     content_image = preprocess_image('content_image.png')
     style_image = np.expand_dims(cv2.resize(style_image[0], content_image.shape[1:3]), axis=0)
 
+    # Create base model
     content_variable = tf.Variable(content_image, name='content-image')
     vgg = tf.keras.applications.vgg19.VGG19(input_shape=content_image.shape[1:],
                                             include_top=False, weights='imagenet')
     vgg.trainable = False
 
+    # extract feature layers which will be used as targets for the transfer
     feature_outputs = [vgg.get_layer(name).output for name in model_output_names]
     feature_model = keras.models.Model(vgg.input, feature_outputs)
     raw_style_features, target_content_features = get_intial_features(feature_model, content_image, style_image)
 
+    # modify model to accept the inital input (this could have
+    # been done with an assign but letting keras set the connection up is easier)
     full_model_input = kl.Input(tensor=content_variable)
     full_model_output = vgg(full_model_input)
-    init = tf.global_variables_initializer()
+    init = tf.global_variables_initializer() # extract initialization ops (makes it easier to find them later)
     keras_graph = K.get_session().graph
     # keras_graph_inputs = [content_variable,]
     keras_graph_outputs = [full_model_output,]
+    # There are placeholder ops and a couple of NoOps that exist here for keras functionality, but they are
+    # not required, so they just get cleaned up.
     keras_graph_inputs = [op for op in get_input_ops(keras_graph) if op.type not in ['NoOp', 'Placeholder']] + [init]
     # keras_graph_outputs = get_output_tensors(keras_graph)
 
-    transfer_graph = tf.Graph()
+    transfer_graph = tf.Graph() # make new graph
     sess = tf.Session(graph=transfer_graph)
     with transfer_graph.as_default():
+        # only import useful parts of keras graph, to make required manipulations more complex.
+        # See simple_model.py for the simpler way of doing this.
         graph_interface = tf.import_graph_def(tf.graph_util.extract_sub_graph(keras_graph.as_graph_def(),
                                               [i.name.split(':')[0] for i in keras_graph_inputs + keras_graph_outputs]),
                                               name='transfer')
@@ -264,8 +272,12 @@ def main():
         graph_inputs = get_input_ops(transfer_graph)
         graph_outputs = get_output_tensors(transfer_graph)
 
+        # get the outputs from the layers that will contain features from the new model
         model_outputs = get_scope_output(transfer_graph, prefix='transfer/vgg19/', op_filter=model_output_names)
 
+        # Variables are python concepts and import_graph_def reimports them as their components
+        # one VariableV2 op an assignment op and a const op. Instead of guessing what was a variable it's
+        # easier to just use the init operator that was created earlier.
         sess.run(transfer_graph.get_operation_by_name('transfer/init_1'))
 
     # print(list(transfer_graph.as_graph_def().node)[0])
@@ -276,6 +288,9 @@ def main():
     with transfer_graph.as_default():
         target_style_features = [gram_matrix(layer) for layer in raw_style_features]
 
+        # The optimizer is expecting a variable, which just contains the initalize op, variable op and initial_value.
+        # So a dummy variable is create that shows the optimizer what it expects to see.
+        # It is lacking some features such as device caching, but that could be fixed if required.
         fake_input = FakeVariable(transfer_graph.get_operation_by_name('transfer/content-image'),
                                   transfer_graph.get_operation_by_name('transfer/content-image/initial_value').outputs[0],
                                   transfer_graph.get_operation_by_name('transfer/content-image/Assign'))
