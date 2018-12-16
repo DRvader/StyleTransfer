@@ -1,3 +1,4 @@
+import argparse
 import cv2
 import numpy as np
 import tensorflow as tf
@@ -12,6 +13,14 @@ from tqdm import tqdm
 # For example an assign op will give the rest of the graph initial values
 # to all global init is, is a list of assignment operators. Once those variables have
 # values the assignments will never be run again because the graph is lazy.
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Run style transfer on input image.')
+    parser.add_argument('content', action='store',
+                        help='The path to the cotent image')
+    parser.add_argument('style', action='store',
+                        help='The path to the style image')
+    return parser.parse_args()
 
 def gram_matrix(input_tensor):
     channels = int(input_tensor.shape[-1])
@@ -65,57 +74,83 @@ def continous_gen(X, Y, batch_size=None):
         if batch_size is None:
             yield X, Y
         else:
-            start = idx*batch_size % len(self.X)
-            end = idx*(batch_size+1) % len(self.X)
+            start = idx*batch_size % len(X)
+            end = idx*(batch_size+1) % len(X)
             idx += 1
             if end < start:
-                start = start - len(self.X)
+                start = start - len(X)
 
-            yield self.X[start:end], self.Y[start:end]
+            yield X[start:end], Y[start:end]
 
-def transfer_loss(style_features, content_features, target_style, target_content, image_variable,
-                  content_weight=1e3, style_weight=1e-2, total_variation_weight=1):
+def transfer_loss(style_features, content_features, target_style_features, target_content_features,
+                  image_variable, target_style,
+                  content_weight=1e3, style_weight=1e-2, total_variation_weight=1, colour_loss_weight=0):
     weight_per_style_layer = 1 / len(style_features)
     weight_per_content_layer = 1 / len(content_features)
 
     style_score = 0
-    for feature, target in zip(style_features, target_style):
+    for feature, target in zip(style_features, target_style_features):
         style_score += weight_per_style_layer * style_loss(feature, target)
 
     content_score = 0
-    for feature, target in zip(content_features, target_content):
+    for feature, target in zip(content_features, target_content_features):
         content_score += weight_per_content_layer * content_loss(feature, target)
+
+    colour_loss = content_loss(image_variable, target_style) * colour_loss_weight
 
     style_score *= style_weight
     content_score *= content_weight
     total_variation_score = total_variation_weight * tf.reduce_mean(total_variation_loss(image_variable))
 
-    return style_score + content_score + total_variation_score
+    return style_score + content_score + total_variation_score + colour_loss
 
 def get_intial_features(model, content_image, style_image):
     stacked_images = np.concatenate([style_image, content_image], axis=0)
 
     with K.get_session().as_default():
+        K.get_session().run(tf.global_variables_initializer())
         output = K.get_session().run(model.output, feed_dict={model.input: stacked_images})
+
     target_style_features = [style_layer[0] for style_layer in output[:len(style_layers)]]
     target_content_features = [content_layer[1] for content_layer in output[len(style_layers):]]
 
     return target_style_features, target_content_features
 
-def preprocess_image(image_path):
+def preprocess_image(image_path, size=None, normalize=True):
     img = cv2.imread(image_path, cv2.IMREAD_COLOR)
+
+    if size is not None:
+        if not (isinstance(size, tuple) or isinstance(size, list)):
+            raise AttributeError()
+
+        if size[0] < 1:
+            img = cv2.resize(img, (0, 0), fx=size[0], fy=size[1])
+        else:
+            img = cv2.resize(img, size)
+
+    img = img.astype('float32')
+
+    if normalize:
+        img[..., 0] -= 103.939
+        img[..., 1] -= 116.779
+        img[..., 2] -= 123.68
+
+    img = img[..., ::-1]
+
     img = np.expand_dims(img, axis=0)
-    img = tf.keras.applications.vgg19.preprocess_input(img)
     return img
 
-def deprocess_image(x):
+def deprocess_image(x, normalize=True):
     # Remove zero-center by mean pixel
-    x[..., 0] += 103.939
-    x[..., 1] += 116.779
-    x[..., 2] += 123.68
+    x = x.copy()
+    if normalize:
+        x[..., 0] += 103.939
+        x[..., 1] += 116.779
+        x[..., 2] += 123.68
+
     # 'BGR'->'RGB'
     x = x[..., ::-1]
-    x = np.clip(x, 0, 255).astype('uint8')
+    # x = np.clip(x, 0, 255).astype('uint8')
     return cv2.hconcat(x)
 
 def get_scope_output(graph, prefix=None, op_filter=None):
@@ -218,26 +253,40 @@ class FakeVariable(variables.RefVariable):
         """The `Operation` of this variable."""
         return self._variable_op
 
-def train(sess, content_variable, to_pull):
+def train(sess, content_variable, to_pull, step_callback=[], steps=1000):
     with sess.as_default():
         sess.run(tf.global_variables_initializer())
-        cv2.imwrite('content_variable.png', deprocess_image(content_variable.eval()))
-        for i in tqdm(range(1000)):
-            _ = sess.run(to_pull)
+        cv2.imwrite('output_images/content_variable.png', deprocess_image(content_variable.eval()))
+        loss = 0
+        pbar = tqdm(range(steps), postfix={'loss': loss})
+        for i in pbar:
+            callbacks = []
+            for callback in step_callback:
+                callbacks.append(tf.assign(callback[1], callback[0](i/steps)))
+            sess.run(callbacks)
+            _, loss = sess.run(to_pull)
+            pbar.set_postfix({'loss': loss})
             if i % 10 == 0:
-                cv2.imwrite('content_variable_{}.png'.format((i % 100) // 10),
+                cv2.imwrite('output_images/content_variable_{}.png'.format((i % 100) // 10),
                             deprocess_image(content_variable.eval()))
 
-        cv2.imwrite('content_variable.png', deprocess_image(content_variable.eval()))
+        cv2.imwrite('output_images/content_variable.png', deprocess_image(content_variable.eval()))
 
 def main():
-    style_image = preprocess_image('style_image.png')
-    content_image = preprocess_image('content_image.png')
-    style_image = np.expand_dims(cv2.resize(style_image[0], content_image.shape[1:3]), axis=0)
+    args = parse_args()
+    content_image = preprocess_image(args.content, size=(256, 256))
+    style_image = preprocess_image(args.style, size=(content_image.shape[2], content_image.shape[1]))
+
+    cv2.imwrite('content_base.png', deprocess_image(content_image))
+    cv2.imwrite('style_base.png', deprocess_image(style_image))
+
+    print('Loaded Images')
+    print(content_image.shape)
 
     # Create base model
+    # content_variable = tf.Variable(content_image, name='content-image', constraint=lambda x:tf.clip_by_value(x, 0, 255))
     content_variable = tf.Variable(content_image, name='content-image')
-    vgg = tf.keras.applications.vgg19.VGG19(input_shape=content_image.shape[1:],
+    vgg = tf.keras.applications.vgg16.VGG16(input_shape=content_image.shape[1:],
                                             include_top=False, weights='imagenet')
     vgg.trainable = False
 
@@ -273,14 +322,16 @@ def main():
         graph_outputs = get_output_tensors(transfer_graph)
 
         # get the outputs from the layers that will contain features from the new model
-        model_outputs = get_scope_output(transfer_graph, prefix='transfer/vgg19/', op_filter=model_output_names)
+        model_outputs = get_scope_output(transfer_graph, prefix='transfer/vgg16/', op_filter=model_output_names)
 
         # Variables are python concepts and import_graph_def reimports them as their components
         # one VariableV2 op an assignment op and a const op. Instead of guessing what was a variable it's
         # easier to just use the init operator that was created earlier.
-        sess.run(transfer_graph.get_operation_by_name('transfer/init_1'))
+        sess.run(transfer_graph.get_operation_by_name('transfer/init_2'))
 
     # print(list(transfer_graph.as_graph_def().node)[0])
+
+    print('Loaded Model')
 
     style_features = model_outputs[:len(style_layers)]
     content_features = model_outputs[len(style_layers):]
@@ -295,11 +346,21 @@ def main():
                                   transfer_graph.get_operation_by_name('transfer/content-image/initial_value').outputs[0],
                                   transfer_graph.get_operation_by_name('transfer/content-image/Assign'))
 
+        learning_rate = tf.Variable(10, name='learning_rate', dtype='float32')
+        variation_loss = tf.Variable(1, name='variation_loss', dtype='float32')
+        colour_loss = tf.Variable(1, name='colour_loss', dtype='float32')
         loss = transfer_loss(style_features, content_features,
-                             target_style_features, target_content_features, fake_input)
-        train_op = tf.train.AdamOptimizer(learning_rate=10).minimize(loss, var_list=[fake_input])
+                             target_style_features, target_content_features, fake_input, style_image,
+                             content_weight=1e3, style_weight=1e-2, total_variation_weight=variation_loss, colour_loss_weight=colour_loss)
+        train_op = tf.train.AdamOptimizer(learning_rate=learning_rate).minimize(loss, var_list=[fake_input])
 
-        train(sess, transfer_graph.get_operation_by_name('transfer/content-image').outputs[0], [train_op, loss])
+        train(sess, transfer_graph.get_operation_by_name('transfer/content-image').outputs[0],
+              [train_op, loss], step_callback=[(lambda percent: (10-0) * percent + 0, variation_loss),
+                                               (lambda percent: (1-5) * percent + 5, learning_rate),
+                                               (lambda percent: (0-1) * percent + 0, colour_loss)])
 
 if __name__ == '__main__':
     main()
+
+# Add a convND of ones that is the size of the upsampling layer after it,
+# this should smooth the output and remove artifacts.
